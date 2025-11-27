@@ -22,11 +22,11 @@ from schedule.schedules import make_fixed_schedule
 class Cifar10FLConfig:
     num_clients: int = 100
     clients_per_round: int = 10
-    num_rounds: int = 50
+    num_rounds: int = 200
     local_epochs: int = 5
     batch_size: int = 64
     lr_local: float = 0.1
-    bit: int = 8  # fixed-bit default
+    bit: int = 8
     device: str = "cuda"
     seed: int = 0
 
@@ -40,10 +40,14 @@ class Cifar10FLConfig:
 
 @dataclass
 class FLLogs:
+    train_loss: List[float]
+    test_loss: List[float]
     test_acc: List[float]
     best_test_acc: List[float]
+
     bits_cum: List[float]
     bits_cum_normalized: List[float]
+
     B_FP: float
     d: int
 
@@ -63,19 +67,33 @@ def build_resnet18_cifar10(num_classes: int = 10) -> nn.Module:
     return model
 
 
-def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+def evaluate_model_loss_and_acc(
+    model: nn.Module, loader: DataLoader, device: torch.device
+) -> tuple[float, float]:
+    """
+    ローダ上での平均クロスエントロピーlossとaccuracyを返す
+    """
     model.eval()
-    correct = 0
+    loss_fn = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    total_correct = 0
     total = 0
+
     with torch.no_grad():
         for xb, yb in loader:
             xb = xb.to(device)
             yb = yb.to(device)
             logits = model(xb)
+            loss = loss_fn(logits, yb)
+
+            total_loss += loss.item() * yb.size(0)
             preds = torch.argmax(logits, dim=1)
-            correct += (preds == yb).sum().item()
+            total_correct += (preds == yb).sum().item()
             total += yb.numel()
-    return correct / float(total)
+
+    avg_loss = total_loss / float(total)
+    acc = total_correct / float(total)
+    return avg_loss, acc
 
 
 def _compute_d_for_bits(model: nn.Module, device: torch.device) -> int:
@@ -165,7 +183,9 @@ def run_cifar10_fl(
         num_workers=config.num_workers,
         seed=config.seed,
     )
-    client_loaders, test_loader = build_cifar10_federated_loaders(data_config)
+    client_loaders, train_eval_loader, test_loader = build_cifar10_federated_loaders(
+        data_config
+    )
 
     # グローバルモデル
     global_model = build_resnet18_cifar10(num_classes=10).to(device)
@@ -194,6 +214,8 @@ def run_cifar10_fl(
         selected_ids_per_round.append(selected_ids)
 
     # logging
+    train_loss_list: List[float] = []
+    test_loss_list: List[float] = []
     test_acc_list: List[float] = []
     best_test_acc_list: List[float] = []
     bits_cum: List[float] = []
@@ -271,19 +293,28 @@ def run_cifar10_fl(
             delta_norm = torch.norm(params_after - params_before).item()
 
         # 評価 & bits ログ
-        acc = evaluate_model(global_model, test_loader, device)
-        best_so_far = max(best_so_far, acc)
+        train_loss, train_acc = evaluate_model_loss_and_acc(
+            global_model, train_eval_loader, device
+        )
+        test_loss, test_acc = evaluate_model_loss_and_acc(
+            global_model, test_loader, device
+        )
+        best_so_far = max(best_so_far, test_acc)
 
         B_t = _compute_bits_per_round(b_t, d, m_t)
         cum_bits += B_t
 
-        test_acc_list.append(acc)
+        train_loss_list.append(train_loss)
+        test_loss_list.append(test_loss)
+        test_acc_list.append(test_acc)
         best_test_acc_list.append(best_so_far)
         bits_cum.append(cum_bits)
 
         print(
             f"[Round {t+1}/{T}] bit={b_t}, "
-            f"test_acc={acc:.4f}, best={best_so_far:.4f}, "
+            f"train_loss={train_loss:.4f}, "
+            f"test_loss={test_loss:.4f}, "
+            f"test_acc={test_acc:.4f}, best={best_so_far:.4f}, "
             f"bits_norm={cum_bits / B_FP:.3f}, "
             f"||Δ_global||={delta_norm:.3e}"
         )
@@ -291,6 +322,8 @@ def run_cifar10_fl(
     bits_cum_normalized = [b / B_FP for b in bits_cum]
 
     return FLLogs(
+        train_loss=train_loss_list,
+        test_loss=test_loss_list,
         test_acc=test_acc_list,
         best_test_acc=best_test_acc_list,
         bits_cum=bits_cum,

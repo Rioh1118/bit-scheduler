@@ -169,6 +169,13 @@ def build_cifar10_federated_loaders(config: Cifar10DataConfig):
         )
         client_loaders.append(loader)
 
+    train_eval_loader = DataLoader(
+        train_ds,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+
     test_loader = DataLoader(
         test_ds,
         batch_size=config.batch_size,
@@ -176,4 +183,4 @@ def build_cifar10_federated_loaders(config: Cifar10DataConfig):
         num_workers=config.num_workers,
     )
 
-    return client_loaders, test_loader
+    return client_loaders, train_eval_loader, test_loader
